@@ -1,12 +1,16 @@
 """FastAPI application: web UI + REST API for standard-address matching."""
 from __future__ import annotations
 
+import hashlib
 import json
+import secrets
+import threading
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -21,6 +25,35 @@ BASE_DIR = Path(__file__).resolve().parent
 # A single connection is fine for this local, low-concurrency tool; SQLite
 # in WAL mode serialises writes internally.
 _conn: db.sqlite3.Connection | None = None
+
+# --- CSV preview sessions ---------------------------------------------------
+#
+# A preview never writes addresses; it only hands out an opaque token that
+# pins the confirmed upload to (a) the exact file bytes (SHA-256) and
+# (b) a content snapshot of the address table taken at preview time. The
+# client re-submits the same file together with the token; inside one
+# ``BEGIN IMMEDIATE`` transaction both bindings are re-checked before the
+# previewed valid rows are inserted.
+
+PREVIEW_TTL_SECONDS = 30 * 60
+_previews: dict[str, dict[str, Any]] = {}
+_previews_lock = threading.Lock()
+
+
+class PreviewExpired(HTTPException):
+    def __init__(self) -> None:
+        super().__init__(
+            status_code=400,
+            detail="预览凭证无效或已过期，请重新预览后再确认写入",
+        )
+
+
+def _purge_expired_previews(now: float | None = None) -> None:
+    now = time.monotonic() if now is None else now
+    expired = [token for token, item in _previews.items()
+               if item["expires_at"] <= now]
+    for token in expired:
+        _previews.pop(token, None)
 
 
 def get_conn() -> db.sqlite3.Connection:
@@ -130,6 +163,160 @@ async def upload_csv(file: UploadFile = File(...),
     return summary
 
 
+async def _read_csv_upload(file: UploadFile) -> bytes:
+    if not file.filename or not file.filename.lower().endswith(".csv"):
+        raise HTTPException(status_code=400, detail="请上传 .csv 文件")
+    content = await file.read()
+    try:
+        ingest.parse_csv_numbered(content)
+    except UnicodeDecodeError as exc:
+        raise HTTPException(status_code=400, detail=f"CSV 解析失败: {exc}") from exc
+    return content
+
+
+@app.post("/api/addresses/upload/preview")
+async def preview_csv_upload(
+    file: UploadFile = File(...),
+    skip_duplicates: bool = True,
+    conn: db.sqlite3.Connection = Depends(get_conn),
+) -> dict[str, Any]:
+    """Validate/classify a CSV without writing anything.
+
+    Returns counts of valid/duplicate/invalid rows (with invalid line
+    numbers) plus an opaque ``token`` that must be presented together with
+    the *same* file to :func:`confirm_csv_upload`.
+    """
+    content = await _read_csv_upload(file)
+    numbered = ingest.parse_csv_numbered(content)
+    classified = ingest.classify_rows(conn, numbered,
+                                      skip_duplicates=skip_duplicates)
+    snapshot = db.address_snapshot(conn)
+    token = secrets.token_urlsafe(32)
+    with _previews_lock:
+        _purge_expired_previews()
+        _previews[token] = {
+            "filename": file.filename,
+            "digest": hashlib.sha256(content).hexdigest(),
+            "snapshot": snapshot,
+            "skip_duplicates": skip_duplicates,
+            "valid_count": len(classified["valid"]),
+            "expires_at": time.monotonic() + PREVIEW_TTL_SECONDS,
+        }
+    return {
+        "token": token,
+        "filename": file.filename,
+        "digest": _previews[token]["digest"],
+        "skip_duplicates": skip_duplicates,
+        "total": len(numbered),
+        "valid_count": len(classified["valid"]),
+        "duplicate_count": len(classified["duplicates"]),
+        "invalid_count": len(classified["invalid"]),
+        "duplicate_lines": [item["line"] for item in classified["duplicates"]],
+        "invalid_rows": classified["invalid"],
+        "valid_lines": [item["line"] for item in classified["valid"]],
+        "expires_in": PREVIEW_TTL_SECONDS,
+    }
+
+
+@app.post("/api/addresses/upload/confirm")
+async def confirm_csv_upload(
+    file: UploadFile = File(...),
+    token: str = Form(...),
+    skip_duplicates: bool | None = None,
+    conn: db.sqlite3.Connection = Depends(get_conn),
+) -> dict[str, Any]:
+    """Persist exactly the rows that were valid in a previous preview.
+
+    The client must re-submit the same file together with the preview
+    ``token``. Within one SQLite write transaction we verify that
+
+    1. the file digest matches the one bound to the token, and
+    2. the address-table snapshot matches the one captured at preview time.
+
+    On either mismatch (or a reused/expired token) nothing is written and the
+    client has to preview the file again.
+    """
+    content = await _read_csv_upload(file)
+    digest = hashlib.sha256(content).hexdigest()
+
+    with _previews_lock:
+        _purge_expired_previews()
+        session = _previews.pop(token, None)
+
+    if session is None:
+        raise PreviewExpired()
+
+    skip = session["skip_duplicates"] if skip_duplicates is None else skip_duplicates
+    if skip != session["skip_duplicates"]:
+        raise HTTPException(
+            status_code=400,
+            detail="跳过重复选项与预览时不一致，请重新预览后再确认写入",
+        )
+
+    # Serialise confirmations against each other while the shared connection
+    # runs a BEGIN IMMEDIATE transaction.
+    with _previews_lock:
+        try:
+            with db.immediate_transaction(conn):
+                current_snapshot = db.address_snapshot(conn)
+                if digest != session["digest"]:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="文件内容与预览时不一致，已拒绝写入，请重新预览",
+                    )
+                if current_snapshot != session["snapshot"]:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="标准地址表在预览后已发生变化，已拒绝写入，请重新预览",
+                    )
+
+                numbered = ingest.parse_csv_numbered(content)
+                classified = ingest.classify_rows(
+                    conn, numbered, skip_duplicates=session["skip_duplicates"]
+                )
+                # Defence in depth: only rows that were valid in the preview
+                # may ever be inserted, and reclassification must agree.
+                if len(classified["valid"]) != session["valid_count"]:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="预览结果与当前校验结果不一致，已拒绝写入，请重新预览",
+                    )
+
+                inserted = 0
+                for item in classified["valid"]:
+                    result = ingest.add_address(
+                        conn, item["row"],
+                        skip_duplicates=session["skip_duplicates"],
+                    )
+                    if result is None:
+                        # The snapshot matched and classification just ran in
+                        # this same transaction, so this cannot happen; fail
+                        # closed instead of silently dropping data.
+                        raise HTTPException(
+                            status_code=409,
+                            detail="写入时发现记录状态与预览不一致，已拒绝写入，请重新预览",
+                        )
+                    inserted += 1
+                if inserted != session["valid_count"]:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="写入条数与预览不一致，已拒绝写入，请重新预览",
+                    )
+        except HTTPException:
+            raise
+        except Exception as exc:  # pragma: no cover - defensive
+            raise HTTPException(status_code=500, detail=f"写入失败: {exc}") from exc
+
+    return {
+        "ok": True,
+        "filename": session["filename"],
+        "inserted": inserted,
+        "duplicates": len(classified["duplicates"]),
+        "invalid": len(classified["invalid"]),
+        "invalid_rows": classified["invalid"],
+    }
+
+
 @app.post("/api/addresses/load-sample")
 def load_sample(conn: db.sqlite3.Connection = Depends(get_conn),
                 settings: Settings = Depends(settings_dep)) -> dict[str, Any]:
@@ -172,7 +359,8 @@ def api_match(payload: MatchRequest,
     result = match_address(payload.query, db.all_addresses(conn), settings)
     data = result_to_dict(result)
     if payload.save:
-        data["match_id"] = _persist_match(conn, result)
+        with db.transaction(conn):
+            data["match_id"] = _persist_match(conn, result)
     return data
 
 

@@ -189,3 +189,159 @@ def test_csv_upload_and_dedup(client):
 
     r = client.post("/api/match", json={"query": "9 Test Ln, Testville 99999"})
     assert r.json()["best_id"] is not None
+
+
+# ------------------------------------------------- CSV preview / confirm flow
+
+
+def _unique_csv(marker: str, *, with_invalid: bool = False,
+                with_duplicate: bool = False) -> bytes:
+    rows = [
+        f"id,full_address,town,zip",
+        f"PV{marker}A,{marker} Preview Alpha Street,PV City {marker},91001",
+        f"PV{marker}B,{marker} Preview Beta Avenue,PV Town {marker},91002",
+    ]
+    if with_duplicate:
+        rows.append(rows[1])  # exact repeat of the first data row
+    if with_invalid:
+        rows.append(",,,")
+    return ("\n".join(rows) + "\n").encode("utf-8")
+
+
+def test_preview_does_not_write_and_reports_counts(client):
+    before = client.get("/api/health").json()["address_count"]
+    csv_bytes = _unique_csv("X1", with_invalid=True)
+    r = client.post("/api/addresses/upload/preview",
+                    files={"file": ("p.csv", csv_bytes, "text/csv")})
+    assert r.status_code == 200
+    data = r.json()
+    assert data["valid_count"] == 2
+    assert data["invalid_count"] == 1
+    # header is line 1, so data rows start at 2; invalid row is line 4
+    assert data["invalid_rows"][0]["line"] == 4
+    assert data["token"]
+    # preview alone must not change the table
+    assert client.get("/api/health").json()["address_count"] == before
+
+
+def test_preview_then_confirm_writes_only_valid_rows(client):
+    csv_bytes = _unique_csv("X2", with_invalid=True, with_duplicate=True)
+    before = client.get("/api/health").json()["address_count"]
+
+    preview = client.post("/api/addresses/upload/preview",
+                          files={"file": ("p.csv", csv_bytes, "text/csv")}).json()
+    assert preview["valid_count"] == 2
+    assert preview["duplicate_count"] == 1
+    assert preview["invalid_count"] == 1
+    assert preview["duplicate_lines"] == [4]
+
+    r = client.post(
+        "/api/addresses/upload/confirm",
+        files={"file": ("p.csv", csv_bytes, "text/csv")},
+        data={"token": preview["token"]},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["inserted"] == 2
+    assert body["duplicates"] == 1
+    assert body["invalid"] == 1
+
+    after = client.get("/api/health").json()["address_count"]
+    assert after == before + 2
+
+    # token is single-use
+    r2 = client.post(
+        "/api/addresses/upload/confirm",
+        files={"file": ("p.csv", csv_bytes, "text/csv")},
+        data={"token": preview["token"]},
+    )
+    assert r2.status_code == 400
+    assert client.get("/api/health").json()["address_count"] == after
+
+
+def test_confirm_rejects_changed_file(client):
+    csv_bytes = _unique_csv("X3")
+    preview = client.post("/api/addresses/upload/preview",
+                          files={"file": ("p.csv", csv_bytes, "text/csv")}).json()
+    before = client.get("/api/health").json()["address_count"]
+
+    tampered = csv_bytes + b"PVX3Z,99 Tampered Lane,Rigged,91099\n"
+    r = client.post(
+        "/api/addresses/upload/confirm",
+        files={"file": ("p.csv", tampered, "text/csv")},
+        data={"token": preview["token"]},
+    )
+    assert r.status_code == 409
+    assert "不一致" in r.json()["detail"]
+    assert client.get("/api/health").json()["address_count"] == before
+
+
+def test_confirm_rejects_stale_table_snapshot(client):
+    csv_bytes = _unique_csv("X4")
+    preview = client.post("/api/addresses/upload/preview",
+                          files={"file": ("p.csv", csv_bytes, "text/csv")}).json()
+    before = client.get("/api/health").json()["address_count"]
+
+    # Another write lands between preview and confirm -> snapshot diverges.
+    other = b"id,full_address\nPVOTHER4,42 Racer Lane, Speedtown 92003\n"
+    assert client.post("/api/addresses/upload",
+                       files={"file": ("o.csv", other, "text/csv")}).status_code == 200
+
+    r = client.post(
+        "/api/addresses/upload/confirm",
+        files={"file": ("p.csv", csv_bytes, "text/csv")},
+        data={"token": preview["token"]},
+    )
+    assert r.status_code == 409
+    assert "标准地址表" in r.json()["detail"]
+    after = client.get("/api/health").json()["address_count"]
+    assert after == before + 1  # only the interleaved upload landed
+
+
+def test_confirm_requires_known_token(client):
+    csv_bytes = _unique_csv("X5")
+    r = client.post(
+        "/api/addresses/upload/confirm",
+        files={"file": ("p.csv", csv_bytes, "text/csv")},
+        data={"token": "not-a-real-token"},
+    )
+    assert r.status_code == 400
+
+
+def test_preview_uses_column_aliases_and_skip_rules(client):
+    csv_bytes = (
+        b"addr,town,zipcode\n"
+        b"7 Preview Sunset Boulevard,Sunset City,93001\n"
+    )
+    r = client.post("/api/addresses/upload/preview",
+                    files={"file": ("p.csv", csv_bytes, "text/csv")})
+    assert r.status_code == 200
+    data = r.json()
+    assert data["valid_count"] == 1
+
+    # Re-previewing the same content after it has been written marks it duplicate.
+    token = data["token"]
+    assert client.post(
+        "/api/addresses/upload/confirm",
+        files={"file": ("p.csv", csv_bytes, "text/csv")},
+        data={"token": token},
+    ).status_code == 200
+
+    again = client.post("/api/addresses/upload/preview",
+                        files={"file": ("p.csv", csv_bytes, "text/csv")}).json()
+    assert again["valid_count"] == 0
+    assert again["duplicate_count"] == 1
+    assert again["duplicate_lines"] == [2]
+
+
+def test_direct_upload_endpoint_is_kept(client):
+    csv_bytes = b"id,full_address\nPVDIRECT,8 Direct Upload Way, Nowhere 94001\n"
+    r = client.post("/api/addresses/upload",
+                    files={"file": ("d.csv", csv_bytes, "text/csv")})
+    assert r.status_code == 200
+    assert r.json()["inserted"] == 1
+    # idempotent second upload -> all duplicates
+    r2 = client.post("/api/addresses/upload",
+                     files={"file": ("d.csv", csv_bytes, "text/csv")})
+    assert r2.json()["inserted"] == 0
+    assert r2.json()["duplicates"] == 1

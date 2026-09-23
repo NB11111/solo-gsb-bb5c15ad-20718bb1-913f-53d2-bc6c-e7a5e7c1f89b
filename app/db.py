@@ -1,6 +1,7 @@
 """SQLite persistence layer (standard-library ``sqlite3``, no ORM needed)."""
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 from contextlib import contextmanager
@@ -80,6 +81,51 @@ def transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
     except Exception:
         conn.rollback()
         raise
+
+
+@contextmanager
+def immediate_transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
+    """Explicit ``BEGIN IMMEDIATE`` write transaction.
+
+    Unlike :func:`transaction` this opens the write lock up front, so a
+    preview-confirm flow can snapshot the address table and write into it
+    atomically without another writer sneaking in between the check and the
+    insert.
+    """
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def address_snapshot(conn: sqlite3.Connection) -> dict[str, Any]:
+    """Content fingerprint of the standard address table.
+
+    The digest is a streaming SHA-256 over each row's logical identity
+    (external_id + full_text), so any insert, delete or change between a
+    preview and its confirmation is detectable. Count and max(id) are included
+    for cheap pre-filtering / diagnostics.
+    """
+    digest = hashlib.sha256()
+    count = 0
+    max_id: int | None = None
+    rows = conn.execute(
+        "SELECT id, external_id, full_text FROM addresses ORDER BY id"
+    )
+    for row in rows:
+        count += 1
+        max_id = int(row["id"])
+        ext = row["external_id"] or ""
+        digest.update(str(row["id"]).encode("utf-8"))
+        digest.update(b"\x1f")
+        digest.update(ext.encode("utf-8"))
+        digest.update(b"\x1f")
+        digest.update((row["full_text"] or "").encode("utf-8"))
+        digest.update(b"\x1e")
+    return {"count": count, "max_id": max_id, "digest": digest.hexdigest()}
 
 
 # ---------------------------------------------------------------- addresses --

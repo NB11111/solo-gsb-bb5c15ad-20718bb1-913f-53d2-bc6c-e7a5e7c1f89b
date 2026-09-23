@@ -147,3 +147,26 @@ th { color: var(--muted); font-weight: 600; }
 .muted { color: var(--muted); font-size: 12px; }
 .ok-msg { color: var(--green); font-size: 13px; }
 .err-msg { color: var(--red); font-size: 13px; }
+
+.check-line {
+    display: inline-flex; align-items: center; gap: 6px;
+    font-size: 13px; color: var(--muted); cursor: pointer;
+}
+
+.preview-box {
+    margin-top: 12px; border: 1px solid var(--line); border-radius: 10px;
+    padding: 14px 16px; background: #fbfcfe;
+}
+.preview-title { font-weight: 600; font-size: 14px; margin-bottom: 10px; word-break: break-all; }
+.preview-stats { display: flex; flex-wrap: wrap; gap: 8px; margin: 8px 0; }
+.pv-chip {
+    font-size: 13px; padding: 4px 12px; border-radius: 999px;
+    background: var(--gray-bg); color: var(--muted);
+}
+.pv-chip b { font-size: 14px; }
+.pv-chip.valid { background: var(--green-bg); color: var(--green); }
+.pv-chip.dup { background: var(--amber-bg); color: var(--amber); }
+.pv-chip.bad { background: var(--red-bg); color: var(--red); }
+.pv-detail { font-size: 12px; margin-top: 6px; word-break: break-all; }
+.pv-detail.dup { color: var(--amber); }
+.pv-detail.bad { color: var(--red); }

@@ -6,8 +6,8 @@
 过小的候选会被标记为 **待确认（needs_review）**，并在界面上展示命中词元、冲突字段与
 可复核结果。
 
-- 🌐 网页界面：单条/批量匹配、上传标准地址 CSV、待确认队列人工复核
-- 🔌 REST API：`/api/match`、`/api/match/batch`、`/api/addresses`、复核接口（含 `/docs` Swagger）
+- 🌐 网页界面：单条/批量匹配、标准地址 CSV **预览后确认导入**（含直接导入入口）、待确认队列人工复核
+- 🔌 REST API：`/api/match`、`/api/match/batch`、`/api/addresses`、CSV 预览/确认导入、复核接口（含 `/docs` Swagger）
 - 🗄️ SQLite 持久化，零外部依赖，数据通过 Docker volume 保存
 - 🌍 归一化：NFKC + 变音符折叠 + 繁简中文映射 + 全角字符、道路缩写（St/Rd/Ave…）、门牌号（`#12-B`/`No.12b`/`12号`）
 
@@ -28,8 +28,10 @@ docker compose up --build
 | 健康检查 | http://localhost:8000/api/health |
 
 - **端口**：`8000`（在 `docker-compose.yml` 的 `ports` 中修改）
-- 首次启动会自动加载内置示例标准地址（`sample_data/standard_addresses.csv`，共 15 条，含中英文地址）
+- **首次启动初始化**：容器启动时自动建表（`app/db.py` 中的 schema），标准地址表为空时会自动加载
+  内置示例标准地址（`sample_data/standard_addresses.csv`，共 15 条，含中英文地址）
 - SQLite 数据库保存在 Docker volume `address-data`（容器内 `/data/addresses.db`），重启不丢失
+- 容器自带 `/api/health` 健康检查；无需任何额外服务或手动初始化步骤
 
 不用 Docker 时：
 
@@ -87,7 +89,33 @@ curl -s -X POST http://localhost:8000/api/match/batch \
   -d '{"queries": ["123 main st ny", "88 Beijing East Rd Shanghai", "xxxxx"]}'
 ```
 
-上传自己的标准地址表：
+上传自己的标准地址表（**预览 → 确认** 两步流程，推荐）：
+
+```bash
+# 1) 预览：只做校验与分类，不写入任何数据
+curl -s -X POST http://localhost:8000/api/addresses/upload/preview \
+  -F 'file=@sample_data/standard_addresses.csv'
+# => {"token": "...", "valid_count": 15, "duplicate_count": 0,
+#     "invalid_count": 0, "invalid_rows": [], "duplicate_lines": [], ...}
+
+# 2) 确认：必须重新提交同一个文件，并带上预览返回的 token
+curl -s -X POST http://localhost:8000/api/addresses/upload/confirm \
+  -F 'file=@sample_data/standard_addresses.csv' \
+  -F 'token=上一步返回的token'
+# => {"ok": true, "inserted": 15, "duplicates": 0, "invalid": 0, ...}
+```
+
+确认接口会在**同一个 SQLite 写事务（BEGIN IMMEDIATE）**内同时校验：
+
+1. 重新提交的文件 SHA-256 摘要与预览凭证绑定的摘要完全一致（文件被改动则拒绝）；
+2. 标准地址表的内容快照（行数 + 全部 `external_id/full_text` 的 SHA-256）与预览时一致
+   （预览后表被其他操作改动则拒绝）。
+
+任一不符都不会写入，接口返回 `409`，且预览凭证一次性失效，需要重新调用预览接口。
+预览凭证 30 分钟有效；确认时只会写入预览中被标记为“有效”的记录，重复记录继续按原规则跳过。
+行号指文件中的行号（表头为第 1 行，首条数据为第 2 行，空行不计）。
+
+需要保留旧的一步直传行为时，仍可使用直接上传接口（网页上勾选“跳过预览，直接导入”等效）：
 
 ```bash
 curl -s -X POST http://localhost:8000/api/addresses/upload \
@@ -159,7 +187,9 @@ CSV 支持的列名（均可识别别名，表头大小写不敏感）：
 | GET | `/api/health` | 健康检查 + 标准地址/待确认计数 |
 | GET | `/api/addresses` | 列出标准地址 |
 | POST | `/api/addresses` | JSON 批量写入标准地址 |
-| POST | `/api/addresses/upload` | 上传 CSV（multipart） |
+| POST | `/api/addresses/upload` | 上传 CSV 直接导入（multipart，保留的旧接口） |
+| POST | `/api/addresses/upload/preview` | 上传 CSV 预览（multipart）：返回有效/重复/无效数量、无效行号与确认凭证 |
+| POST | `/api/addresses/upload/confirm` | 重新提交同一文件 + `token`，事务内校验摘要与表快照后写入有效记录 |
 | POST | `/api/addresses/load-sample` | 重新加载内置示例数据 |
 | POST | `/api/match` | 单条地址匹配 |
 | POST | `/api/match/batch` | 批量地址匹配 |

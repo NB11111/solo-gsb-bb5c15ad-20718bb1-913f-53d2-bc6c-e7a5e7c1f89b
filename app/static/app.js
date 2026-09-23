@@ -270,24 +270,115 @@ $("#btn-sample").addEventListener("click", async () => {
     }
 });
 
+// Current pending CSV preview (kept so the user can confirm with the same File).
+let pendingPreview = null;
+
+async function uploadForm(path, form) {
+    const res = await fetch(path, { method: "POST", body: form });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || `请求失败 (${res.status})`);
+    return data;
+}
+
+function resetCsvPicker() {
+    pendingPreview = null;
+    $("#csv-file").value = "";
+    $("#csv-preview-box").innerHTML = "";
+}
+
+function renderPreviewBox(data, file) {
+    const wrap = $("#csv-preview-box");
+    const invalidLines = (data.invalid_rows || []).map((r) =>
+        `第 ${r.line} 行${r.reason ? `（${escapeHtml(r.reason)}）` : ""}`);
+    const duplicateLines = (data.duplicate_lines || []).map((n) => `第 ${n} 行`);
+    wrap.innerHTML = `
+        <div class="preview-box">
+            <div class="preview-title">📋 预览：${escapeHtml(file.name)}
+                <span class="muted">（共 ${data.total} 行数据，凭证 ${Math.round(data.expires_in / 60)} 分钟内有效）</span>
+            </div>
+            <div class="preview-stats">
+                <span class="pv-chip valid">有效 <b>${data.valid_count}</b></span>
+                <span class="pv-chip dup">重复 <b>${data.duplicate_count}</b></span>
+                <span class="pv-chip bad">无效 <b>${data.invalid_count}</b></span>
+            </div>
+            ${duplicateLines.length ? `<div class="pv-detail dup">重复行：${duplicateLines.join("、")}（将自动跳过）</div>` : ""}
+            ${invalidLines.length ? `<div class="pv-detail bad">无效行：${invalidLines.join("、")}</div>` : ""}
+            <div class="hint" style="margin:8px 0 0">
+                确认写入时将重新提交同一文件；若文件被改动或此期间标准地址表发生变化，写入会被拒绝，需要重新预览。
+            </div>
+            <div class="row">
+                <button id="btn-csv-confirm" class="primary"
+                    ${data.valid_count === 0 ? "disabled" : ""}>确认写入 ${data.valid_count} 条有效记录</button>
+                <button id="btn-csv-cancel" class="ghost">取消</button>
+            </div>
+        </div>`;
+}
+
 $("#csv-file").addEventListener("change", async (event) => {
     const file = event.target.files[0];
     if (!file) return;
+    $("#table-msg").textContent = "";
+
+    // Legacy direct-upload path, kept for users/scripts that want it.
+    if ($("#csv-direct-upload").checked) {
+        const form = new FormData();
+        form.append("file", file);
+        try {
+            const data = await uploadForm("/api/addresses/upload", form);
+            $("#table-msg").innerHTML =
+                `<span class="ok-msg">${escapeHtml(file.name)}：新增 ${data.inserted} 条，` +
+                `重复 ${data.duplicates} 条，无效 ${data.invalid} 条</span>`;
+            loadAddresses();
+            refreshHealth();
+        } catch (err) {
+            $("#table-msg").innerHTML = `<span class="err-msg">${escapeHtml(err.message)}</span>`;
+        } finally {
+            event.target.value = "";
+        }
+        return;
+    }
+
     const form = new FormData();
     form.append("file", file);
+    $("#csv-preview-box").innerHTML = '<p class="muted">正在解析并预览…</p>';
     try {
-        const res = await fetch("/api/addresses/upload", { method: "POST", body: form });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.detail || "上传失败");
+        const data = await uploadForm("/api/addresses/upload/preview", form);
+        pendingPreview = { file, token: data.token };
+        renderPreviewBox(data, file);
+    } catch (err) {
+        pendingPreview = null;
+        $("#csv-preview-box").innerHTML = `<p class="err-msg">${escapeHtml(err.message)}</p>`;
+        event.target.value = "";
+    }
+});
+
+$("#csv-preview-box").addEventListener("click", async (event) => {
+    if (event.target.closest("#btn-csv-cancel")) {
+        resetCsvPicker();
+        return;
+    }
+    const btn = event.target.closest("#btn-csv-confirm");
+    if (!btn || !pendingPreview) return;
+    btn.disabled = true;
+    const form = new FormData();
+    // The exact same file must be re-submitted together with the token.
+    form.append("file", pendingPreview.file);
+    form.append("token", pendingPreview.token);
+    try {
+        const data = await uploadForm("/api/addresses/upload/confirm", form);
         $("#table-msg").innerHTML =
-            `<span class="ok-msg">${escapeHtml(file.name)}：新增 ${data.inserted} 条，` +
-            `重复 ${data.duplicates} 条，无效 ${data.invalid} 条</span>`;
+            `<span class="ok-msg">${escapeHtml(data.filename)}：已写入 ${data.inserted} 条有效记录` +
+            `，跳过重复 ${data.duplicates} 条，无效 ${data.invalid} 条</span>`;
+        resetCsvPicker();
         loadAddresses();
         refreshHealth();
     } catch (err) {
-        $("#table-msg").innerHTML = `<span class="err-msg">${escapeHtml(err.message)}</span>`;
-    } finally {
-        event.target.value = "";
+        $("#table-msg").innerHTML =
+            `<span class="err-msg">${escapeHtml(err.message)}</span>`;
+        btn.disabled = false;
+        // Token is single-use / stale after a failed confirm: pick the file again.
+        pendingPreview = null;
+        $("#csv-file").value = "";
     }
 });
 

@@ -121,3 +121,70 @@ def parse_csv(content: bytes) -> list[dict[str, str]]:
     text = content.decode("utf-8-sig")
     reader = csv.DictReader(io.StringIO(text))
     return [dict(row) for row in reader]
+
+
+def parse_csv_numbered(content: bytes) -> list[tuple[int, dict[str, str]]]:
+    """Parse CSV into ``(line_no, row)`` pairs.
+
+    ``line_no`` is the 1-based line number in the uploaded file (the header is
+    line 1, so the first data row is line 2); blank lines are skipped the same
+    way :func:`parse_csv` does.
+    """
+    text = content.decode("utf-8-sig")
+    reader = csv.reader(io.StringIO(text))
+    rows = list(reader)
+    if not rows:
+        return []
+    header = rows[0]
+    numbered: list[tuple[int, dict[str, str]]] = []
+    for offset, values in enumerate(rows[1:], start=2):
+        # A truly blank line parses as [] or a single whitespace field and is
+        # skipped; a multi-column row that is merely all-empty (e.g. ",,,")
+        # must be kept so it can be reported back as an invalid data row.
+        if not values or (len(values) == 1 and not values[0].strip()):
+            continue
+        row = {header[i] if i < len(header) else None:
+               (values[i] if i < len(values) else None)
+               for i in range(max(len(header), len(values)))}
+        numbered.append((offset, dict(row)))
+    return numbered
+
+
+def classify_rows(
+    conn: sqlite3.Connection,
+    numbered_rows: list[tuple[int, dict[str, Any]]],
+    skip_duplicates: bool = True,
+) -> dict[str, list[dict[str, Any]]]:
+    """Dry-run classification without writing anything.
+
+    Uses the same column aliases (:data:`_FIELD_ALIASES`) and the same
+    duplicate rule as :func:`add_address`: an existing row with the same
+    ``full_text`` or ``external_id`` is a duplicate, and so are repeated
+    keys inside the same uploaded file.
+    """
+    valid: list[dict[str, Any]] = []
+    duplicates: list[dict[str, Any]] = []
+    invalid: list[dict[str, Any]] = []
+
+    seen_texts: set[str] = set()
+    seen_external: set[str] = set()
+    for line_no, row in numbered_rows:
+        norm_row = normalize_row(row)
+        full_text = norm_row.get("full_text")
+        if not full_text:
+            invalid.append({"line": line_no, "reason": "缺少地址内容（所有列均为空或无法识别）"})
+            continue
+        external_id = norm_row.get("external_id")
+        if skip_duplicates and (
+            db.address_exists(conn, full_text, external_id)
+            or full_text in seen_texts
+            or (external_id is not None and external_id in seen_external)
+        ):
+            duplicates.append({"line": line_no, "full_text": full_text})
+        else:
+            valid.append({"line": line_no, "full_text": full_text, "row": row})
+        seen_texts.add(full_text)
+        if external_id is not None:
+            seen_external.add(external_id)
+
+    return {"valid": valid, "duplicates": duplicates, "invalid": invalid}

@@ -44,11 +44,20 @@
             <h2>标准地址表</h2>
             <div class="row wrap">
                 <input type="file" id="csv-file" accept=".csv" class="hidden-file">
-                <label for="csv-file" class="btn ghost-file">上传 CSV</label>
+                <label for="csv-file" class="btn ghost-file">选择 CSV 并预览</label>
+                <label class="check-line">
+                    <input type="checkbox" id="csv-direct-upload">
+                    跳过预览，直接导入
+                </label>
                 <button id="btn-sample" class="ghost">加载内置示例数据</button>
                 <button id="btn-refresh-table" class="ghost">刷新</button>
                 <span id="table-msg"></span>
             </div>
+            <p class="hint">
+                默认流程为<b>先预览、再确认写入</b>：选择文件后会展示有效 / 重复 / 无效数量及无效行号，
+                确认无误后才写入；预览后若文件被改动或地址表有变化，需要重新预览。
+            </p>
+            <div id="csv-preview-box"></div>
             <p class="hint">
                 CSV 支持的列名：<code>address</code>(或 full_address)、<code>line1</code>(street)、
                 <code>city</code>(town)、<code>state</code>(province)、
