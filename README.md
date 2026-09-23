@@ -87,12 +87,38 @@ curl -s -X POST http://localhost:8000/api/match/batch \
   -d '{"queries": ["123 main st ny", "88 Beijing East Rd Shanghai", "xxxxx"]}'
 ```
 
-上传自己的标准地址表：
+上传自己的标准地址表（直接上传，服务端解析后立即写入并跳过重复）：
 
 ```bash
 curl -s -X POST http://localhost:8000/api/addresses/upload \
   -F 'file=@sample_data/standard_addresses.csv'
 ```
+
+**上传前预览确认（推荐）**：先预览有效/重复/无效数量与无效行号，确认时再
+**重新提交同一文件**。服务端会在同一个 SQLite 写事务内核对预览凭证绑定的
+文件 SHA-256 摘要与地址表快照，任一不符都不会写入，必须重新预览。
+
+```bash
+# 1) 预览：不写入任何记录，返回 preview_token 与统计
+curl -s -X POST http://localhost:8000/api/addresses/preview \
+  -F 'file=@sample_data/standard_addresses.csv'
+# => {"preview_token":"...","valid":15,"duplicates":0,"invalid":0,
+#     "invalid_lines":[],"total":15,"filename":"..."}
+
+# 2) 确认：必须再次提交文件，并带上预览凭证
+curl -s -X POST http://localhost:8000/api/addresses/confirm \
+  -F 'file=@sample_data/standard_addresses.csv' \
+  -F 'preview_token=上一步返回的 token'
+# => {"inserted":15,"duplicates":0,"invalid":0,"invalid_lines":[],...}
+```
+
+- 预览只写入一条带 30 分钟有效期的凭证（含文件摘要、地址表快照、有效行内容），
+  **不写地址表**；
+- 确认时若文件被改动（摘要不符）、地址表在预览后发生变化（快照不符）、
+  凭证不存在或已过期，接口分别返回 `409` / `409` / `404`，整笔事务回滚，
+  需要重新调用预览接口；
+- 确认成功后凭证立即失效（一次性），且仅写入该次预览中分类为「有效」的记录；
+- 「标准地址表」页默认勾选「上传前先预览确认」；取消勾选则继续使用直接上传接口。
 
 CSV 支持的列名（均可识别别名，表头大小写不敏感）：
 
@@ -159,7 +185,9 @@ CSV 支持的列名（均可识别别名，表头大小写不敏感）：
 | GET | `/api/health` | 健康检查 + 标准地址/待确认计数 |
 | GET | `/api/addresses` | 列出标准地址 |
 | POST | `/api/addresses` | JSON 批量写入标准地址 |
-| POST | `/api/addresses/upload` | 上传 CSV（multipart） |
+| POST | `/api/addresses/upload` | 上传 CSV（multipart，直接写入，跳过重复） |
+| POST | `/api/addresses/preview` | 上传 CSV 生成预览凭证：有效/重复/无效数量 + 无效行号（不写入） |
+| POST | `/api/addresses/confirm` | 重新提交文件 + `preview_token`，事务内校验摘要/快照后仅写入有效记录 |
 | POST | `/api/addresses/load-sample` | 重新加载内置示例数据 |
 | POST | `/api/match` | 单条地址匹配 |
 | POST | `/api/match/batch` | 批量地址匹配 |

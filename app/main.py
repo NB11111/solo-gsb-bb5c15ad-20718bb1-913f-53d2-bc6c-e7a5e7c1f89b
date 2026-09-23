@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -111,7 +111,8 @@ def create_address(payload: AddressBatchIn,
         raw = item.lookup_fields()
         raw["full_text"] = item.full_text or item.address
         rows.append(raw)
-    summary = ingest.add_many(conn, rows, skip_duplicates=payload.skip_duplicates)
+    with db.transaction(conn):
+        summary = ingest.add_many(conn, rows, skip_duplicates=payload.skip_duplicates)
     return summary
 
 
@@ -128,6 +129,45 @@ async def upload_csv(file: UploadFile = File(...),
     summary = ingest.add_many(conn, rows)
     summary["filename"] = file.filename
     return summary
+
+
+def _read_csv(file: UploadFile, content: bytes) -> None:
+    if not file.filename or not file.filename.lower().endswith(".csv"):
+        raise HTTPException(status_code=400, detail="请上传 .csv 文件")
+    try:
+        # Validate that the bytes really are decodable CSV up front.
+        ingest.parse_csv_numbered(content)
+    except UnicodeDecodeError as exc:
+        raise HTTPException(status_code=400, detail=f"CSV 解析失败: {exc}") from exc
+
+
+@app.post("/api/addresses/preview")
+async def preview_csv(file: UploadFile = File(...),
+                      conn: db.sqlite3.Connection = Depends(get_conn)) -> dict[str, Any]:
+    """Validate an uploaded CSV and return a confirmable preview voucher."""
+    content = await file.read()
+    _read_csv(file, content)
+    return ingest.preview_csv(conn, content, file.filename)
+
+
+@app.post("/api/addresses/confirm")
+async def confirm_csv(file: UploadFile = File(...),
+                      preview_token: str = Form(...),
+                      conn: db.sqlite3.Connection = Depends(get_conn)) -> dict[str, Any]:
+    """Commit a preview: the file must be re-submitted together with its token.
+
+    File digest and address-table snapshot bound to the voucher are re-checked
+    inside the same SQLite write transaction that performs the inserts.
+    """
+    content = await file.read()
+    _read_csv(file, content)
+    try:
+        return ingest.confirm_csv(conn, content, preview_token)
+    except ingest.PreviewExpired as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ingest.PreviewError as exc:
+        # File mismatch or table changed -> nothing is written, re-preview first.
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @app.post("/api/addresses/load-sample")
@@ -172,7 +212,8 @@ def api_match(payload: MatchRequest,
     result = match_address(payload.query, db.all_addresses(conn), settings)
     data = result_to_dict(result)
     if payload.save:
-        data["match_id"] = _persist_match(conn, result)
+        with db.transaction(conn):
+            data["match_id"] = _persist_match(conn, result)
     return data
 
 

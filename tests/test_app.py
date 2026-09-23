@@ -189,3 +189,179 @@ def test_csv_upload_and_dedup(client):
 
     r = client.post("/api/match", json={"query": "9 Test Ln, Testville 99999"})
     assert r.json()["best_id"] is not None
+
+
+# ----------------------------------------------------- CSV preview / confirm
+
+
+def _preview_csv(prefix: str) -> bytes:
+    # line 2 valid, line 3 invalid (all blanks), line 4 valid,
+    # line 5 an in-file repeat of line 2 (duplicate).
+    return (
+        "external_id,address,city,zip\n"
+        f"{prefix}-001,1 Preview Way,Previewton,10001\n"
+        ",,,\n"
+        f"{prefix}-002,2 Preview Ave,Previewton,10002\n"
+        f"{prefix}-001,1 Preview Way,Previewton,10001\n"
+    ).encode()
+
+
+def test_preview_then_confirm_writes_only_valid(client):
+    csv_bytes = _preview_csv("PA")
+    before = client.get("/api/health").json()["address_count"]
+    r = client.post("/api/addresses/preview",
+                    files={"file": ("p.csv", csv_bytes, "text/csv")})
+    assert r.status_code == 200
+    data = r.json()
+    assert data["valid"] == 2
+    assert data["duplicates"] == 1
+    assert data["invalid"] == 1
+    assert data["invalid_lines"] == [3]
+    assert data["total"] == 4
+    token = data["preview_token"]
+
+    # Preview must not have written anything yet.
+    assert client.get("/api/health").json()["address_count"] == before
+
+    # Confirm requires the file to be re-submitted alongside the token.
+    r = client.post(
+        "/api/addresses/confirm",
+        files={"file": ("p.csv", csv_bytes, "text/csv")},
+        data={"preview_token": token},
+    )
+    assert r.status_code == 200
+    result = r.json()
+    assert result["inserted"] == 2
+    assert result["duplicates"] == 1
+    assert result["invalid"] == 1
+    assert result["invalid_lines"] == [3]
+    assert client.get("/api/health").json()["address_count"] == before + 2
+
+    # The voucher is single-use: confirming again fails.
+    r = client.post(
+        "/api/addresses/confirm",
+        files={"file": ("p.csv", csv_bytes, "text/csv")},
+        data={"preview_token": token},
+    )
+    assert r.status_code == 404
+
+
+def test_preview_uses_header_aliases(client):
+    csv_bytes = b"id,addr,town,postcode\nPAL,7 Alpha Road,Alphaville,20001\n"
+    r = client.post("/api/addresses/preview",
+                    files={"file": ("a.csv", csv_bytes, "text/csv")})
+    assert r.status_code == 200
+    data = r.json()
+    assert data["valid"] == 1
+    assert data["invalid"] == 0
+    r = client.post(
+        "/api/addresses/confirm",
+        files={"file": ("a.csv", csv_bytes, "text/csv")},
+        data={"preview_token": data["preview_token"]},
+    )
+    assert r.status_code == 200
+    assert r.json()["inserted"] == 1
+
+
+def test_preview_confirm_rejects_changed_file(client):
+    csv_bytes = _preview_csv("PB")
+    r = client.post("/api/addresses/preview",
+                    files={"file": ("p.csv", csv_bytes, "text/csv")})
+    token = r.json()["preview_token"]
+    before = client.get("/api/health").json()["address_count"]
+
+    # A different file body carrying the same token must be refused.
+    tampered = csv_bytes.replace(b"2 Preview Ave", b"99 Other Street")
+    r = client.post(
+        "/api/addresses/confirm",
+        files={"file": ("p.csv", tampered, "text/csv")},
+        data={"preview_token": token},
+    )
+    assert r.status_code == 409
+    # Nothing was written.
+    assert client.get("/api/health").json()["address_count"] == before
+
+    # The voucher is not consumed by the failed attempt, but the original file
+    # was never confirmed; re-preview fresh (unique ids) data and confirm it.
+    fresh = (
+        "external_id,address\nPB2-001,3 Fresh Court\nPB2-002,4 Fresh Plaza\n"
+    ).encode()
+    r = client.post("/api/addresses/preview",
+                    files={"file": ("f.csv", fresh, "text/csv")})
+    assert r.status_code == 200
+    r = client.post(
+        "/api/addresses/confirm",
+        files={"file": ("f.csv", fresh, "text/csv")},
+        data={"preview_token": r.json()["preview_token"]},
+    )
+    assert r.status_code == 200
+    assert r.json()["inserted"] == 2
+
+
+def test_preview_confirm_rejects_changed_table(client):
+    csv_bytes = _preview_csv("PC")
+    r = client.post("/api/addresses/preview",
+                    files={"file": ("p.csv", csv_bytes, "text/csv")})
+    token = r.json()["preview_token"]
+    before = client.get("/api/health").json()["address_count"]
+
+    # Another writer (the legacy direct-upload endpoint) mutates the table.
+    other = b"id,address\nPCINT,8 Interloper Lane\n"
+    assert client.post("/api/addresses/upload",
+                       files={"file": ("o.csv", other, "text/csv")}).status_code == 200
+
+    r = client.post(
+        "/api/addresses/confirm",
+        files={"file": ("p.csv", csv_bytes, "text/csv")},
+        data={"preview_token": token},
+    )
+    assert r.status_code == 409
+    # Only the interloper was written; the stale preview wrote nothing.
+    assert client.get("/api/health").json()["address_count"] == before + 1
+
+    # Re-preview fresh (unique ids) data against the new snapshot, then confirm.
+    fresh = (
+        "external_id,address\nPC2-001,5 New Crescent\nPC2-002,6 New Gardens\n"
+    ).encode()
+    r = client.post("/api/addresses/preview",
+                    files={"file": ("f.csv", fresh, "text/csv")})
+    assert r.status_code == 200
+    r = client.post(
+        "/api/addresses/confirm",
+        files={"file": ("f.csv", fresh, "text/csv")},
+        data={"preview_token": r.json()["preview_token"]},
+    )
+    assert r.status_code == 200
+    assert r.json()["inserted"] == 2
+
+
+def test_preview_confirm_unknown_token(client):
+    r = client.post(
+        "/api/addresses/confirm",
+        files={"file": ("p.csv", _preview_csv("PD"), "text/csv")},
+        data={"preview_token": "does-not-exist"},
+    )
+    assert r.status_code == 404
+
+
+def test_preview_rejects_non_csv(client):
+    r = client.post("/api/addresses/preview",
+                    files={"file": ("p.txt", b"hello", "text/plain")})
+    assert r.status_code == 400
+
+
+def test_preview_invalid_lines_use_physical_numbers(client):
+    # A blank physical line between data rows is skipped by the csv module and
+    # not counted; the trailing invalid row still reports its true line number.
+    content = (
+        b"external_id,address\n"   # line 1 header
+        b"PLN1,11 Line Lane\n"     # line 2 valid
+        b"\n"                       # line 3 blank -> skipped
+        b",\n"                      # line 4 invalid
+    )
+    r = client.post("/api/addresses/preview",
+                    files={"file": ("l.csv", content, "text/csv")})
+    data = r.json()
+    assert data["valid"] == 1
+    assert data["invalid"] == 1
+    assert data["invalid_lines"] == [4]

@@ -89,6 +89,29 @@ button.override { background: var(--amber-bg); color: var(--amber); }
 button.reject { background: var(--red-bg); color: var(--red); }
 
 .hidden-file { display: none; }
+.hidden { display: none !important; }
+
+.inline-check {
+    display: inline-flex; align-items: center; gap: 6px;
+    font-size: 13px; color: var(--ink); cursor: pointer;
+}
+.inline-check input { cursor: pointer; }
+
+.preview-panel {
+    margin-top: 12px; padding: 14px 16px;
+    border: 1px solid var(--primary); border-radius: 10px;
+    background: var(--card);
+}
+.preview-head { display: flex; align-items: center; justify-content: space-between; }
+.preview-title { font-weight: 600; font-size: 14px; word-break: break-all; }
+.preview-counts { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0 8px; }
+.pv-chip {
+    font-size: 13px; font-weight: 600; padding: 4px 12px; border-radius: 999px;
+}
+.pv-chip.valid { background: var(--green-bg); color: var(--green); }
+.pv-chip.dup { background: var(--amber-bg); color: var(--amber); }
+.pv-chip.invalid { background: var(--red-bg); color: var(--red); }
+.preview-lines { font-size: 13px; color: var(--ink); margin-bottom: 6px; word-break: break-all; }
 
 .result {
     background: var(--card); border: 1px solid var(--line);

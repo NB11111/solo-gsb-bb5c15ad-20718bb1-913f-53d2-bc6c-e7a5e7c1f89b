@@ -270,24 +270,161 @@ $("#btn-sample").addEventListener("click", async () => {
     }
 });
 
+// ---------------------------------------------------- CSV preview / confirm
+
+// The file picked for the current pending preview (kept so confirm can
+// re-submit the exact same bytes to the server).
+let pendingFile = null;
+let pendingToken = null;
+
+function clearPreview() {
+    pendingFile = null;
+    pendingToken = null;
+    $("#csv-preview-panel").classList.add("hidden");
+    $("#csv-preview-panel").innerHTML = "";
+}
+
+$("#csv-preview-mode").addEventListener("change", () => {
+    clearPreview();
+    $("#csv-file").value = "";
+});
+
+function csvForm(file) {
+    const form = new FormData();
+    form.append("file", file);
+    return form;
+}
+
+function renderPreview(data) {
+    const lines = data.invalid_lines.length
+        ? data.invalid_lines.map((n) => `第 ${n} 行`).join("、")
+        : "无";
+    $("#csv-preview-panel").innerHTML = `
+        <div class="preview-head">
+            <span class="preview-title">📄 ${escapeHtml(data.filename)} 预览结果（共 ${data.total} 行）</span>
+        </div>
+        <div class="preview-counts">
+            <span class="pv-chip valid">有效 ${data.valid}</span>
+            <span class="pv-chip dup">重复 ${data.duplicates}</span>
+            <span class="pv-chip invalid">无效 ${data.invalid}</span>
+        </div>
+        <div class="preview-lines">无效行（CSV 物理行号，表头为第 1 行）：${escapeHtml(lines)}</div>
+        <p class="hint">
+            确认时需重新上传同一文件；若文件内容或标准地址表在预览后发生变化，
+            服务器将拒绝写入，需要重新预览。
+        </p>
+        <div class="row">
+            <button id="btn-csv-confirm" class="primary"${data.valid === 0 ? " disabled" : ""}>
+                确认写入 ${data.valid} 条有效记录
+            </button>
+            <button id="btn-csv-cancel" class="ghost">取消</button>
+            <button id="btn-csv-repreview" class="ghost hidden">重新预览</button>
+            <span id="csv-confirm-msg"></span>
+        </div>`;
+    $("#csv-preview-panel").classList.remove("hidden");
+}
+
+async function createPreview(file) {
+    const panel = $("#csv-preview-panel");
+    panel.classList.remove("hidden");
+    panel.innerHTML = '<p class="muted">正在校验预览…</p>';
+    const res = await fetch("/api/addresses/preview", {
+        method: "POST",
+        body: csvForm(file),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || "预览失败");
+    pendingFile = file;
+    pendingToken = data.preview_token;
+    renderPreview(data);
+}
+
 $("#csv-file").addEventListener("change", async (event) => {
     const file = event.target.files[0];
     if (!file) return;
-    const form = new FormData();
-    form.append("file", file);
+    $("#table-msg").innerHTML = "";
+    clearPreview();
     try {
-        const res = await fetch("/api/addresses/upload", { method: "POST", body: form });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.detail || "上传失败");
+        if ($("#csv-preview-mode").checked) {
+            await createPreview(file);
+            // Keep the filename in the input so users can see what is pending;
+            // confirm re-reads it and re-submits the bytes.
+        } else {
+            await directUpload(file);
+        }
+    } catch (err) {
+        $("#table-msg").innerHTML = `<span class="err-msg">${escapeHtml(err.message)}</span>`;
+        clearPreview();
+        event.target.value = "";
+    }
+});
+
+async function directUpload(file) {
+    const res = await fetch("/api/addresses/upload", {
+        method: "POST",
+        body: csvForm(file),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || "上传失败");
+    $("#table-msg").innerHTML =
+        `<span class="ok-msg">${escapeHtml(file.name)}：新增 ${data.inserted} 条，` +
+        `重复 ${data.duplicates} 条，无效 ${data.invalid} 条</span>`;
+    $("#csv-file").value = "";
+    loadAddresses();
+    refreshHealth();
+}
+
+$("#csv-preview-panel").addEventListener("click", async (event) => {
+    if (event.target.closest("#btn-csv-cancel")) {
+        clearPreview();
+        $("#csv-file").value = "";
+        return;
+    }
+    if (event.target.closest("#btn-csv-repreview")) {
+        if (pendingFile) await createPreview(pendingFile);
+        return;
+    }
+    const confirmBtn = event.target.closest("#btn-csv-confirm");
+    if (!confirmBtn) return;
+
+    // Confirm must re-submit the file alongside the preview token.
+    const file = $("#csv-file").files[0];
+    const msg = $("#csv-confirm-msg");
+    if (!file) {
+        msg.innerHTML = '<span class="err-msg">请重新选择同一个文件后再确认</span>';
+        return;
+    }
+    confirmBtn.disabled = true;
+    const form = csvForm(file);
+    form.append("preview_token", pendingToken || "");
+    try {
+        const res = await fetch("/api/addresses/confirm", {
+            method: "POST",
+            body: form,
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+            // Digest/snapshot mismatch or expired voucher: require re-preview.
+            msg.innerHTML =
+                `<span class="err-msg">${escapeHtml(data.detail || "确认失败")}，` +
+                `请点击「重新预览」后再确认。</span>`;
+            $("#btn-csv-confirm").classList.add("hidden");
+            $("#btn-csv-repreview").classList.remove("hidden");
+            return;
+        }
+        const lines = (data.invalid_lines || []).length
+            ? `，无效行：${data.invalid_lines.map((n) => `第 ${n} 行`).join("、")}`
+            : "";
         $("#table-msg").innerHTML =
-            `<span class="ok-msg">${escapeHtml(file.name)}：新增 ${data.inserted} 条，` +
-            `重复 ${data.duplicates} 条，无效 ${data.invalid} 条</span>`;
+            `<span class="ok-msg">${escapeHtml(data.filename)}：确认写入 ${data.inserted} 条，` +
+            `重复 ${data.duplicates} 条，无效 ${data.invalid} 条${lines}</span>`;
+        clearPreview();
+        $("#csv-file").value = "";
         loadAddresses();
         refreshHealth();
     } catch (err) {
-        $("#table-msg").innerHTML = `<span class="err-msg">${escapeHtml(err.message)}</span>`;
-    } finally {
-        event.target.value = "";
+        msg.innerHTML = `<span class="err-msg">${escapeHtml(err.message)}</span>`;
+        confirmBtn.disabled = false;
     }
 });
 

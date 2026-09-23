@@ -1,6 +1,7 @@
 """SQLite persistence layer (standard-library ``sqlite3``, no ORM needed)."""
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 from contextlib import contextmanager
@@ -51,6 +52,21 @@ CREATE TABLE IF NOT EXISTS match_logs (
     review_action    TEXT                   -- confirmed | overridden | rejected
 );
 CREATE INDEX IF NOT EXISTS idx_match_logs_status ON match_logs(status);
+
+CREATE TABLE IF NOT EXISTS upload_previews (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    token           TEXT NOT NULL UNIQUE,
+    filename        TEXT NOT NULL,
+    file_sha256     TEXT NOT NULL,
+    table_snapshot  TEXT NOT NULL,          -- JSON digest of the address table
+    valid_rows_json TEXT NOT NULL,          -- JSON rows that would be written
+    valid_count     INTEGER NOT NULL,
+    duplicate_count INTEGER NOT NULL,
+    invalid_count   INTEGER NOT NULL,
+    invalid_lines   TEXT NOT NULL DEFAULT '[]',
+    created_at      TEXT NOT NULL,
+    expires_at      TEXT NOT NULL
+);
 """
 
 
@@ -74,6 +90,23 @@ def init_db(conn: sqlite3.Connection) -> None:
 
 @contextmanager
 def transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
+@contextmanager
+def immediate_transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
+    """Open a write transaction up-front (BEGIN IMMEDIATE).
+
+    Acquiring the write lock before any reads guarantees that a table snapshot
+    taken inside the block is still the same snapshot the INSERTs commit against
+    -- another connection cannot mutate the table in between.
+    """
+    conn.execute("BEGIN IMMEDIATE")
     try:
         yield conn
         conn.commit()
@@ -150,6 +183,68 @@ def address_exists(conn: sqlite3.Connection, full_text: str, external_id: str | 
             "SELECT 1 FROM addresses WHERE full_text = ? LIMIT 1", (full_text,)
         ).fetchone()
     return row is not None
+
+
+def address_table_snapshot(conn: sqlite3.Connection) -> str:
+    """Stable digest of the current contents of the addresses table.
+
+    Combines the row count, the maximum id and a hash over every row in id
+    order, so any insert/delete changes the snapshot (ids are never reused).
+    Must be called inside a write transaction when used for confirm validation.
+    """
+    rows = conn.execute("SELECT id, full_text, external_id FROM addresses ORDER BY id").fetchall()
+    hasher = hashlib.sha256()
+    for row in rows:
+        hasher.update(f"{row['id']}\x1f{row['full_text']}\x1f{row['external_id'] or ''}\n".encode("utf-8"))
+    return json.dumps(
+        {"count": len(rows), "max_id": rows[-1]["id"] if rows else 0,
+         "digest": hasher.hexdigest()},
+        ensure_ascii=False,
+    )
+
+
+# ------------------------------------------------------------- upload previews --
+
+def insert_upload_preview(conn: sqlite3.Connection, *, token: str, filename: str,
+                          file_sha256: str, table_snapshot: str,
+                          valid_rows: list[dict[str, Any]], valid_count: int,
+                          duplicate_count: int, invalid_count: int,
+                          invalid_lines: list[int], ttl_seconds: int) -> None:
+    now = datetime.now(timezone.utc)
+    expires = datetime.fromtimestamp(now.timestamp() + ttl_seconds, tz=timezone.utc)
+    conn.execute(
+        """
+        INSERT INTO upload_previews
+            (token, filename, file_sha256, table_snapshot, valid_rows_json,
+             valid_count, duplicate_count, invalid_count, invalid_lines,
+             created_at, expires_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            token, filename, file_sha256, table_snapshot,
+            json.dumps(valid_rows, ensure_ascii=False),
+            valid_count, duplicate_count, invalid_count,
+            json.dumps(invalid_lines),
+            now.isoformat(timespec="seconds"),
+            expires.isoformat(timespec="seconds"),
+        ),
+    )
+
+
+def get_upload_preview(conn: sqlite3.Connection, token: str) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM upload_previews WHERE token = ?", (token,)
+    ).fetchone()
+
+
+def delete_upload_preview(conn: sqlite3.Connection, token: str) -> None:
+    conn.execute("DELETE FROM upload_previews WHERE token = ?", (token,))
+
+
+def delete_expired_previews(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        "DELETE FROM upload_previews WHERE expires_at < ?", (_now(),)
+    )
 
 
 # ---------------------------------------------------------------- match logs --
